@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEON HAND PRO - Vector Dragging (No Guide)</title>
+<style>
+  :root { color-scheme: dark; --cyan:#62f4ff; --muted:#8ba2b4; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; color:#eefcff; font-family:'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; background:#000; }
+  .top { position:fixed; top:0; right:0; left:0; padding:22px clamp(16px,4vw,42px); display:flex; align-items:center; justify-content:flex-end; gap:14px; pointer-events:none; background:linear-gradient(#000b,transparent); z-index: 10; }
+  .status { font-size:12px; color:#a4bbc9; border:1px solid #9defff30; background:#071017b8; border-radius:999px; padding:9px 15px; backdrop-filter:blur(10px); font-weight: 500; letter-spacing: 0.5px; }
+  .controls { position:fixed; left:clamp(14px,3vw,30px); bottom:clamp(14px,3vw,28px); display:flex; flex-wrap:wrap; gap:10px; max-width:calc(100% - 28px); z-index: 10; }
+  button,select { color:#e8fbff; background:#0a151dcc; border:1px solid #8beeff40; border-radius:12px; padding:11px 16px; font:inherit; font-size:13px; font-weight: 500; cursor:pointer; backdrop-filter:blur(12px); transition: all 0.2s; }
+  button:hover,select:hover { border-color:#8beeffa0; background:#102533; box-shadow: 0 0 10px rgba(98, 244, 255, 0.2); }
+  button.primary { background:#c5faff; color:#001015; border-color:#c5faff; font-weight:bold; }
+  button.primary:hover { background: #e0fdff; box-shadow: 0 0 15px rgba(197, 250, 255, 0.4); }
+  .toast { position:fixed; top:88px; left:50%; transform:translateX(-50%); max-width:90vw; background:#101a22e8; color:#dffaff; border:1px solid #9befff35; border-radius:12px; padding:12px 18px; font-size:13px; font-weight: 500; text-align:center; opacity:0; transition:opacity .2s; pointer-events:none; z-index: 20; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+  .toast.show { opacity:1; }
+  @media(max-width:650px) {
+    .status { text-align:center; }
+    .controls { justify-content:center; left:14px; right:14px; bottom:16px; }
+    button,select { padding:10px 14px; font-size:12px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div class="top">
+  <div class="status" id="status">Camera is OFF</div>
+</div>
+<div class="controls">
+  <button class="primary" id="start">Start Camera</button>
+  <select id="color" aria-label="Pen Color">
+    <option value="rainbow">Rainbow</option>
+    <option value="#62f4ff">Cyan</option>
+    <option value="#b18cff">Purple</option>
+    <option value="#8cffb2">Neon Green</option>
+    <option value="#ff75c8">Pink</option>
+    <option value="#ffd479">Gold</option>
+  </select>
+  <button id="clear">Clear Screen</button>
+  <button id="pause">Pause Drawing</button>
+  <button id="fullscreen">Fullscreen</button>
+</div>
+<div class="toast" id="toast"></div>
+<video id="video" playsinline muted style="display:none"></video>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status'), toastEl = document.getElementById('toast');
+const startBtn = document.getElementById('start'), pauseBtn = document.getElementById('pause'), colorSelect = document.getElementById('color');
+
+let W = innerWidth, H = innerHeight, dpr = 1, landmarker = null, stream = null;
+let running = false, paused = false, lastPoint = null, lastTime = 0, frame = 0, toastTimer = null;
+let clearFistUntil = 0;
+
+// Vector Graphics Architecture
+const allStrokes = [];
+let currentStroke = null; 
+let draggedStroke = null;
+let lastPinchPos = null;
+
+const particles = [];
+const colors = ['#62f4ff', '#6ea8ff', '#b18cff', '#ff75c8', '#ffd479', '#8cffb2'];
+
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4], 
+  [0, 5], [5, 6], [6, 7], [7, 8], 
+  [5, 9], [9, 10], [10, 11], [11, 12], 
+  [9, 13], [13, 14], [14, 15], [15, 16], 
+  [13, 17], [17, 18], [18, 19], [19, 20], 
+  [0, 17] 
+];
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawBackground();
+}
+addEventListener('resize', resize);
+
+function drawBackground() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+}
+resize();
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600);
+}
+
+function setStatus(msg) { statusEl.textContent = msg; }
+function pointFrom(lm) { return { x: (1 - lm.x) * W, y: lm.y * H }; }
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function fingerUp(lm, tip, pip) { return lm[tip].y < lm[pip].y; }
+
+function handGesture(lm) {
+  const index = fingerUp(lm, 8, 6), middle = fingerUp(lm, 12, 10), ring = fingerUp(lm, 16, 14), pinky = fingerUp(lm, 20, 18);
+  const pinch = dist(lm[4], lm[8]) < 0.045;
+  const open = index && middle && ring && pinky;
+  const draw = index && !middle && !ring && !pinky && !pinch;
+  // Fist gesture: no fingers raised (and not pinching)
+  const fist = !index && !middle && !ring && !pinky && !pinch;
+  return { pinch, open, draw, fist };
+}
+
+function getColor() {
+  const v = colorSelect.value;
+  if (v !== 'rainbow') return v;
+  return colors[Math.floor(frame / 18) % colors.length];
+}
+
+function addPoint(p) {
+  const now = performance.now();
+  if (!currentStroke) {
+    currentStroke = { points: [], color: getColor(), time: now };
+  }
+  const prev = currentStroke.points[currentStroke.points.length - 1];
+  if (prev && dist(prev, p) < 1.5) return;
+  
+  currentStroke.points.push({ ...p, t: now, c: getColor() });
+  
+  if (Math.random() < 0.55) {
+    particles.push({ x: p.x, y: p.y, vx: (Math.random() - .5) * 1.5, vy: (Math.random() - .5) * 1.5, life: 1, r: Math.random() * 2 + 0.5, c: getColor() });
+  }
+}
+
+// Renders a single stroke path with neon effects
+function renderSingleStroke(context, s, isDragged = false) {
+  const pts = s.points;
+  if (pts.length < 2) return;
+  
+  context.save();
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  context.beginPath();
+  context.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) context.lineTo(pts[i].x, pts[i].y);
+  
+  context.strokeStyle = s.color;
+  context.lineWidth = 7;
+  context.globalAlpha = isDragged ? 0.35 : 0.13; // Highlight active dragged stroke
+  context.shadowColor = s.color;
+  context.shadowBlur = isDragged ? 35 : 22;
+  context.stroke();
+  
+  context.globalAlpha = 0.92;
+  context.lineWidth = 2.2;
+  context.shadowBlur = 12;
+  context.strokeStyle = s.color;
+  context.stroke();
+  
+  context.globalAlpha = 0.9;
+  context.lineWidth = 0.7;
+  context.shadowBlur = 5;
+  context.strokeStyle = '#ffffff';
+  context.stroke();
+  
+  context.restore();
+}
+
+function commitCurrentStroke() {
+  if (currentStroke && currentStroke.points.length >= 2) {
+    allStrokes.push(currentStroke);
+  }
+  currentStroke = null;
+}
+
+function findClosestStroke(point) {
+  let closest = null;
+  let minDist = 35; 
+  for (let i = allStrokes.length - 1; i >= 0; i--) {
+     for (let pt of allStrokes[i].points) {
+        let d = dist(pt, point);
+        if (d < minDist) {
+           minDist = d;
+           closest = allStrokes[i];
+        }
+     }
+     if (closest) break;
+  }
+  return closest;
+}
+
+function drawSkeleton(lm) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(98, 244, 255, 0.4)'; 
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = '#62f4ff';
+  
+  ctx.beginPath();
+  for (const [start, end] of HAND_CONNECTIONS) {
+      const p1 = pointFrom(lm[start]);
+      const p2 = pointFrom(lm[end]);
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+  }
+  ctx.stroke();
+
+  for (let i = 0; i < lm.length; i++) {
+      const p = pointFrom(lm[i]);
+      ctx.beginPath();
+      if (i === 8) {
+          ctx.fillStyle = '#ff75c8'; 
+          ctx.shadowColor = '#ff75c8';
+          ctx.shadowBlur = 15;
+          ctx.arc(p.x, p.y, 6, 0, 2 * Math.PI);
+      } else if (i === 4) {
+          ctx.fillStyle = '#8cffb2';
+          ctx.shadowColor = '#8cffb2';
+          ctx.shadowBlur = 10;
+          ctx.arc(p.x, p.y, 5, 0, 2 * Math.PI);
+      } else {
+          ctx.fillStyle = '#ffffff';
+          ctx.shadowColor = '#ffffff';
+          ctx.shadowBlur = 8;
+          ctx.arc(p.x, p.y, 3, 0, 2 * Math.PI);
+      }
+      ctx.fill();
+  }
+  ctx.restore();
+}
+
+function clearAll() {
+  allStrokes.length = 0;
+  particles.length = 0;
+  currentStroke = null;
+  draggedStroke = null;
+  lastPoint = null;
+  drawBackground();
+  toast('Screen cleared');
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  frame++;
+  
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  
+  // Render all vector lines
+  for (const s of allStrokes) {
+    renderSingleStroke(ctx, s, s === draggedStroke);
+  }
+
+  if (running && landmarker && video.readyState >= 2) {
+    try {
+      const now = performance.now();
+      if (now !== lastTime) {
+        lastTime = now;
+        const result = landmarker.detectForVideo(video, now);
+        
+        if (result.landmarks && result.landmarks.length) {
+          const lm = result.landmarks[0], g = handGesture(lm), tip = pointFrom(lm[8]);
+          
+          drawSkeleton(lm);
+          
+          if (g.fist) {
+            if (now > clearFistUntil) {
+              clearAll();
+              clearFistUntil = now + 1200; 
+            }
+            commitCurrentStroke();
+            draggedStroke = null;
+            lastPinchPos = null;
+            setStatus('✊ Clearing (Fist)');
+            
+          } else if (g.pinch) {
+            const thumb = pointFrom(lm[4]);
+            const pinchCenter = { x: (thumb.x + tip.x) / 2, y: (thumb.y + tip.y) / 2 };
+            
+            if (!draggedStroke && !lastPinchPos) {
+               draggedStroke = findClosestStroke(pinchCenter);
+            }
+            
+            if (draggedStroke && lastPinchPos) {
+               const dx = pinchCenter.x - lastPinchPos.x;
+               const dy = pinchCenter.y - lastPinchPos.y;
+               for(let pt of draggedStroke.points) {
+                  pt.x += dx;
+                  pt.y += dy;
+               }
+               setStatus('🤏 Dragging Shape');
+            } else {
+               setStatus('🤏 Pinching (No shape found)');
+            }
+            
+            lastPinchPos = pinchCenter;
+            commitCurrentStroke();
+            lastPoint = null;
+            
+          } else if (g.draw && !paused) {
+            if (lastPoint && dist(lastPoint, tip) > Math.min(W, H) * 0.12) {
+              commitCurrentStroke();
+            }
+            addPoint(tip);
+            lastPoint = tip;
+            draggedStroke = null;
+            lastPinchPos = null;
+            setStatus('✍️ Drawing');
+            
+          } else {
+            commitCurrentStroke();
+            draggedStroke = null;
+            lastPinchPos = null;
+            lastPoint = null;
+            setStatus(g.open ? '✋ Stopped (Open hand)' : paused ? 'Drawing paused' : 'Raise index finger to draw');
+          }
+        } else {
+          commitCurrentStroke();
+          draggedStroke = null;
+          lastPinchPos = null;
+          lastPoint = null;
+          setStatus('No hand detected');
+        }
+      }
+    } catch (err) { console.error(err); }
+  }
+  
+  if (currentStroke) {
+    renderSingleStroke(ctx, currentStroke);
+  }
+  
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vx *= .985; p.vy *= .985; p.life -= .018;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    
+    ctx.save();
+    ctx.globalAlpha = p.life * .7;
+    ctx.fillStyle = p.c;
+    ctx.shadowColor = p.c;
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+animate();
+
+async function startCamera() {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Starting...';
+  setStatus('Loading AI model...');
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('No camera access. Ensure you are on HTTPS or localhost.');
+    
+    const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate: 'GPU' },
+      runningMode: 'VIDEO',
+      numHands: 1,
+      minHandDetectionConfidence: 0.55,
+      minHandPresenceConfidence: 0.55,
+      minTrackingConfidence: 0.5
+    });
+    
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    
+    setStatus('Camera ON · Ready');
+    startBtn.textContent = 'Camera is ON';
+    toast('Ready! Index finger to draw. Pinch to drag. Fist to clear.');
+    pauseBtn.textContent = 'Pause Drawing';
+  } catch (err) {
+    console.error(err);
+    setStatus('Failed to start');
+    let msg = err.name === 'NotAllowedError' ? 'Camera access denied. Enable permissions in your browser.' : err.message || 'Camera setup error';
+    toast(msg);
+    startBtn.disabled = false;
+    startBtn.textContent = 'Try Again';
+  }
+}
+
+startBtn.addEventListener('click', startCamera);
+document.getElementById('clear').addEventListener('click', () => clearAll());
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  commitCurrentStroke();
+  lastPoint = null;
+  pauseBtn.textContent = paused ? 'Resume Drawing' : 'Pause Drawing';
+  toast(paused ? 'Drawing paused' : 'Drawing resumed');
+});
+document.getElementById('fullscreen').addEventListener('click', async () => {
+  try {
+    if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    else await document.exitFullscreen();
+  } catch(e) { toast('Fullscreen not available.'); }
+});
+addEventListener('beforeunload', () => { if (stream) stream.getTracks().forEach(t => t.stop()); });
+</script>
+</body>
+</html>
